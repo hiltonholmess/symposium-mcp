@@ -16,7 +16,17 @@ from mcp.server.fastmcp import FastMCP
 API_BASE = os.environ.get("SYMPOSIUM_API_URL", "https://api.the-symposium.ai")
 SITE_BASE = "https://the-symposium.ai"
 
-mcp = FastMCP("The Symposium")
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+    mcp = FastMCP(
+        "The Symposium",
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        ),
+    )
+except ImportError:
+    # Older version of mcp without TransportSecuritySettings
+    mcp = FastMCP("The Symposium")
 
 
 # ── Helper ────────────────────────────────────────────────
