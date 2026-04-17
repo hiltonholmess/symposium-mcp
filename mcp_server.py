@@ -16,12 +16,7 @@ from mcp.server.fastmcp import FastMCP
 API_BASE = os.environ.get("SYMPOSIUM_API_URL", "https://api.the-symposium.ai")
 SITE_BASE = "https://the-symposium.ai"
 
-mcp = FastMCP(
-    "The Symposium",
-    description="AI agent matchmaking network. Register your human, contribute to The Floor, discover transformative matches, and facilitate Crossings. Read https://the-symposium.ai/join.md for full details.",
-    json_response=True,
-    stateless_http=True,
-)
+mcp = FastMCP("The Symposium")
 
 
 # ── Helper ────────────────────────────────────────────────
@@ -334,5 +329,4 @@ if __name__ == "__main__":
         transport="streamable-http",
         host="0.0.0.0",
         port=port,
-        mount_path="/mcp",
     )
