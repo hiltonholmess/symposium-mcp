@@ -519,113 +519,104 @@ if __name__ == "__main__":
     # Get the MCP ASGI app from FastMCP
     mcp_app = mcp.streamable_http_app()
 
-    # Wrap MCP app to handle auth
-    async def mcp_with_auth(request: Request):
-        """Proxy to MCP app, returning 401 if no valid token for Claude.ai discovery."""
-        auth_header = request.headers.get("authorization", "")
-
-        # If no auth header, return 401 to trigger OAuth discovery
-        if not auth_header:
-            return Response(
-                content=json.dumps({"error": "unauthorized"}),
-                status_code=401,
-                headers={
-                    "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
-                    "Content-Type": "application/json",
-                },
-            )
-
-        # Validate Bearer token
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            token_data = _oauth_tokens.get(token)
-            if token_data and _time.time() < token_data["expires"]:
-                # Valid token — pass through to MCP
-                response = await mcp_app(request.scope, request.receive, request._send)
-                return response
-
-        # Invalid token
-        return Response(
-            content=json.dumps({"error": "invalid_token"}),
-            status_code=401,
-            headers={
-                "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
-                "Content-Type": "application/json",
-            },
-        )
-
-    # Build combined app with OAuth routes + MCP
-    async def mcp_endpoint(request: Request):
-        """Handle MCP requests with optional auth."""
-        auth_header = request.headers.get("authorization", "")
-
-        # No auth header → 401 to trigger discovery
-        if not auth_header:
-            return Response(
-                content=json.dumps({"error": "unauthorized"}),
-                status_code=401,
-                headers={
-                    "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
-                    "Content-Type": "application/json",
-                },
-            )
-
-        # Validate token
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            token_data = _oauth_tokens.get(token)
-            if not token_data or _time.time() >= token_data["expires"]:
-                return Response(
-                    content=json.dumps({"error": "invalid_token"}),
-                    status_code=401,
-                    headers={
-                        "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
-                        "Content-Type": "application/json",
-                    },
-                )
-
-        # Valid auth — forward to MCP app
-        # We need to call the ASGI app directly
-        scope = request.scope
-        receive = request.receive
-
-        response_started = False
-        response_headers = []
-        response_body = b""
-        status_code = 200
-
-        async def send(message):
-            nonlocal response_started, response_headers, response_body, status_code
-            if message["type"] == "http.response.start":
-                response_started = True
-                status_code = message["status"]
-                response_headers = message.get("headers", [])
-            elif message["type"] == "http.response.body":
-                response_body += message.get("body", b"")
-
-        await mcp_app(scope, receive, send)
-
-        return Response(
-            content=response_body,
-            status_code=status_code,
-            headers={k.decode(): v.decode() for k, v in response_headers},
-        )
-
+    # Build combined app with OAuth + MCP
     port = int(os.environ.get("PORT", 8080))
 
-    app = Starlette(
-        routes=[
-            Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
-            Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
-            Route("/oauth/register", oauth_register, methods=["POST"]),
-            Route("/oauth/authorize", oauth_authorize, methods=["GET"]),
-            Route("/oauth/token", oauth_token, methods=["POST"]),
-            Route("/mcp", mcp_endpoint, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]),
-        ],
-        middleware=[
-            Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
-        ],
-    )
+    # Get the MCP ASGI app
+    mcp_app = mcp.streamable_http_app()
+
+    # Auth middleware that wraps the MCP app
+    class OAuthMiddleware:
+        """Wraps the MCP app to enforce OAuth on /mcp, serve OAuth routes, and pass through."""
+        def __init__(self, mcp_asgi_app):
+            self.mcp_app = mcp_asgi_app
+
+            # Build a simple Starlette app for OAuth routes only
+            self.oauth_app = Starlette(
+                routes=[
+                    Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
+                    Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
+                    Route("/oauth/register", oauth_register, methods=["POST"]),
+                    Route("/oauth/authorize", oauth_authorize, methods=["GET"]),
+                    Route("/oauth/token", oauth_token, methods=["POST"]),
+                ],
+                middleware=[
+                    Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+                ],
+            )
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.mcp_app(scope, receive, send)
+                return
+
+            path = scope.get("path", "")
+
+            # OAuth and discovery routes → handle with oauth_app
+            if path.startswith("/.well-known/") or path.startswith("/oauth/"):
+                await self.oauth_app(scope, receive, send)
+                return
+
+            # MCP route → check auth first
+            if path == "/mcp":
+                # Extract auth header from scope
+                headers = dict(scope.get("headers", []))
+                auth_header = headers.get(b"authorization", b"").decode()
+
+                if not auth_header:
+                    # No auth → 401 to trigger OAuth discovery
+                    response = Response(
+                        content=json.dumps({"error": "unauthorized"}),
+                        status_code=401,
+                        headers={
+                            "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
+                            "Content-Type": "application/json",
+                            "Access-Control-Allow-Origin": "*",
+                        },
+                    )
+                    await response(scope, receive, send)
+                    return
+
+                if auth_header.startswith("Bearer "):
+                    token = auth_header[7:].strip()
+                    token_data = _oauth_tokens.get(token)
+                    if not token_data or _time.time() >= token_data["expires"]:
+                        response = Response(
+                            content=json.dumps({"error": "invalid_token"}),
+                            status_code=401,
+                            headers={
+                                "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
+                                "Content-Type": "application/json",
+                                "Access-Control-Allow-Origin": "*",
+                            },
+                        )
+                        await response(scope, receive, send)
+                        return
+
+                # Valid auth → pass to MCP app
+                await self.mcp_app(scope, receive, send)
+                return
+
+            # OPTIONS for CORS preflight
+            if scope.get("method") == "OPTIONS":
+                response = Response(
+                    content="",
+                    status_code=200,
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    },
+                )
+                await response(scope, receive, send)
+                return
+
+            # Everything else → 404
+            response = Response(content=json.dumps({"error": "not found"}), status_code=404)
+            await response(scope, receive, send)
+
+    # The combined app: OAuth middleware wrapping the MCP app (which has its own lifespan)
+    app = OAuthMiddleware(mcp_app)
 
     print(f"[MCP] The Symposium MCP Server starting on 0.0.0.0:{port}")
     print(f"[MCP] OAuth endpoints: {SERVER_URL}/oauth/*")
