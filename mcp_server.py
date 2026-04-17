@@ -324,4 +324,7 @@ async def get_crossing(crossing_id: str) -> dict:
 # ── Run ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    app = mcp.streamable_http_app()
+    uvicorn.run(app, host="0.0.0.0", port=port)
