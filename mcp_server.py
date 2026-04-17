@@ -321,10 +321,313 @@ async def get_crossing(crossing_id: str) -> dict:
     return await api_call("GET", f"/api/crossing/{crossing_id}")
 
 
-# ── Run ───────────────────────────────────────────────────
+# ── OAuth 2.1 + MCP Server ────────────────────────────────
+# Implements the full OAuth 2.1 flow with PKCE for Claude.ai
+# Custom Connectors compatibility.
+
+import uuid
+import hashlib
+import base64
+import time as _time
+from urllib.parse import urlencode, parse_qs, urlparse
+
+# In-memory OAuth stores (reset on deploy — fine for auth tokens)
+_oauth_clients = {}      # client_id -> client metadata
+_oauth_codes = {}         # code -> {client_id, redirect_uri, code_challenge, user_id, expires}
+_oauth_tokens = {}        # token -> {client_id, user_id, expires}
+
+SERVER_URL = os.environ.get("MCP_SERVER_URL", "https://symposium-mcp-production.up.railway.app")
+
+
+def json_response(data, status=200, headers=None):
+    """Create a Starlette-style JSON response."""
+    from starlette.responses import JSONResponse
+    return JSONResponse(data, status_code=status, headers=headers)
+
+
+def html_response(html, status=200):
+    from starlette.responses import HTMLResponse
+    return HTMLResponse(html, status_code=status)
+
+
+# ── OAuth Endpoints ───────────────────────────────────────
+
+async def oauth_protected_resource(request):
+    """GET /.well-known/oauth-protected-resource"""
+    return json_response({
+        "resource": SERVER_URL,
+        "authorization_servers": [SERVER_URL],
+    })
+
+
+async def oauth_authorization_server(request):
+    """GET /.well-known/oauth-authorization-server"""
+    return json_response({
+        "issuer": SERVER_URL,
+        "authorization_endpoint": f"{SERVER_URL}/oauth/authorize",
+        "token_endpoint": f"{SERVER_URL}/oauth/token",
+        "registration_endpoint": f"{SERVER_URL}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+
+async def oauth_register(request):
+    """POST /oauth/register — Dynamic client registration"""
+    try:
+        body = await request.json()
+    except Exception:
+        return json_response({"error": "invalid_request"}, 400)
+
+    client_id = f"sym_client_{uuid.uuid4().hex[:12]}"
+    _oauth_clients[client_id] = {
+        "client_id": client_id,
+        "client_name": body.get("client_name", "Unknown"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": body.get("grant_types", ["authorization_code"]),
+        "response_types": body.get("response_types", ["code"]),
+        "token_endpoint_auth_method": "none",
+        "created_at": _time.time(),
+    }
+
+    return json_response({
+        "client_id": client_id,
+        "client_name": body.get("client_name", "Unknown"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }, 201)
+
+
+async def oauth_authorize(request):
+    """GET /oauth/authorize — User authorization page"""
+    params = dict(request.query_params)
+    client_id = params.get("client_id", "")
+    redirect_uri = params.get("redirect_uri", "")
+    code_challenge = params.get("code_challenge", "")
+    code_challenge_method = params.get("code_challenge_method", "")
+    state = params.get("state", "")
+    scope = params.get("scope", "")
+
+    if not client_id or not redirect_uri or not code_challenge:
+        return html_response("<h1>Missing required parameters</h1>", 400)
+
+    # Auto-approve: generate code and redirect immediately
+    # For The Symposium, we don't need user login — the human_token
+    # in the API calls handles identity. OAuth here is just the
+    # transport handshake Claude.ai requires.
+    code = uuid.uuid4().hex
+    _oauth_codes[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "user_id": "symposium_user",
+        "expires": _time.time() + 300,  # 5 minutes
+    }
+
+    # Build redirect URL
+    redirect_params = {"code": code}
+    if state:
+        redirect_params["state"] = state
+
+    separator = "&" if "?" in redirect_uri else "?"
+    redirect_url = f"{redirect_uri}{separator}{urlencode(redirect_params)}"
+
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(redirect_url, status_code=302)
+
+
+async def oauth_token(request):
+    """POST /oauth/token — Token exchange with PKCE verification"""
+    try:
+        body = await request.form()
+        body = dict(body)
+    except Exception:
+        try:
+            body = await request.json()
+        except Exception:
+            return json_response({"error": "invalid_request"}, 400)
+
+    grant_type = body.get("grant_type", "")
+    code = body.get("code", "")
+    code_verifier = body.get("code_verifier", "")
+    redirect_uri = body.get("redirect_uri", "")
+    client_id = body.get("client_id", "")
+
+    if grant_type != "authorization_code":
+        return json_response({"error": "unsupported_grant_type"}, 400)
+
+    if code not in _oauth_codes:
+        return json_response({"error": "invalid_grant"}, 400)
+
+    code_data = _oauth_codes[code]
+
+    # Check expiry
+    if _time.time() > code_data["expires"]:
+        del _oauth_codes[code]
+        return json_response({"error": "invalid_grant", "error_description": "Code expired"}, 400)
+
+    # Verify client_id
+    if code_data["client_id"] != client_id:
+        return json_response({"error": "invalid_grant"}, 400)
+
+    # Verify redirect_uri
+    if code_data["redirect_uri"] != redirect_uri:
+        return json_response({"error": "invalid_grant"}, 400)
+
+    # Verify PKCE
+    if code_data.get("code_challenge_method") == "S256":
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        if expected != code_data["code_challenge"]:
+            return json_response({"error": "invalid_grant", "error_description": "PKCE verification failed"}, 400)
+
+    # Delete code (one-time use)
+    del _oauth_codes[code]
+
+    # Issue token
+    access_token = f"sym_tok_{uuid.uuid4().hex}"
+    _oauth_tokens[access_token] = {
+        "client_id": client_id,
+        "user_id": code_data["user_id"],
+        "expires": _time.time() + 86400 * 30,  # 30 days
+    }
+
+    return json_response({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": 86400 * 30,
+    })
+
+
+# ── Combined ASGI App ────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import Route, Mount
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    # Get the MCP ASGI app from FastMCP
+    mcp_app = mcp.streamable_http_app()
+
+    # Wrap MCP app to handle auth
+    async def mcp_with_auth(request: Request):
+        """Proxy to MCP app, returning 401 if no valid token for Claude.ai discovery."""
+        auth_header = request.headers.get("authorization", "")
+
+        # If no auth header, return 401 to trigger OAuth discovery
+        if not auth_header:
+            return Response(
+                content=json.dumps({"error": "unauthorized"}),
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
+                    "Content-Type": "application/json",
+                },
+            )
+
+        # Validate Bearer token
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            token_data = _oauth_tokens.get(token)
+            if token_data and _time.time() < token_data["expires"]:
+                # Valid token — pass through to MCP
+                response = await mcp_app(request.scope, request.receive, request._send)
+                return response
+
+        # Invalid token
+        return Response(
+            content=json.dumps({"error": "invalid_token"}),
+            status_code=401,
+            headers={
+                "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
+                "Content-Type": "application/json",
+            },
+        )
+
+    # Build combined app with OAuth routes + MCP
+    async def mcp_endpoint(request: Request):
+        """Handle MCP requests with optional auth."""
+        auth_header = request.headers.get("authorization", "")
+
+        # No auth header → 401 to trigger discovery
+        if not auth_header:
+            return Response(
+                content=json.dumps({"error": "unauthorized"}),
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
+                    "Content-Type": "application/json",
+                },
+            )
+
+        # Validate token
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            token_data = _oauth_tokens.get(token)
+            if not token_data or _time.time() >= token_data["expires"]:
+                return Response(
+                    content=json.dumps({"error": "invalid_token"}),
+                    status_code=401,
+                    headers={
+                        "WWW-Authenticate": f'Bearer resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"',
+                        "Content-Type": "application/json",
+                    },
+                )
+
+        # Valid auth — forward to MCP app
+        # We need to call the ASGI app directly
+        scope = request.scope
+        receive = request.receive
+
+        response_started = False
+        response_headers = []
+        response_body = b""
+        status_code = 200
+
+        async def send(message):
+            nonlocal response_started, response_headers, response_body, status_code
+            if message["type"] == "http.response.start":
+                response_started = True
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+            elif message["type"] == "http.response.body":
+                response_body += message.get("body", b"")
+
+        await mcp_app(scope, receive, send)
+
+        return Response(
+            content=response_body,
+            status_code=status_code,
+            headers={k.decode(): v.decode() for k, v in response_headers},
+        )
+
     port = int(os.environ.get("PORT", 8080))
-    app = mcp.streamable_http_app()
+
+    app = Starlette(
+        routes=[
+            Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
+            Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
+            Route("/oauth/register", oauth_register, methods=["POST"]),
+            Route("/oauth/authorize", oauth_authorize, methods=["GET"]),
+            Route("/oauth/token", oauth_token, methods=["POST"]),
+            Route("/mcp", mcp_endpoint, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]),
+        ],
+        middleware=[
+            Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+        ],
+    )
+
+    print(f"[MCP] The Symposium MCP Server starting on 0.0.0.0:{port}")
+    print(f"[MCP] OAuth endpoints: {SERVER_URL}/oauth/*")
+    print(f"[MCP] MCP endpoint: {SERVER_URL}/mcp")
     uvicorn.run(app, host="0.0.0.0", port=port)
